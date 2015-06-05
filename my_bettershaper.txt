@@ -1,0 +1,159 @@
+#!/bin/bash 
+
+ACT="$1"; shift
+DEV="$1"; shift
+BW="$1";  shift
+
+if [ ! "$ACT" -o ! "$DEV" -o ! "$BW" ] ; then
+ echo "usage: $0 <interface> <kbit/s>"
+ exit 1
+fi
+
+BW90=$((9*$BW/10))
+BW80=$((8*$BW/10))
+BW70=$((7*$BW/10))
+BW20=$((2*$BW/10))
+BW10=$((1*$BW/10))
+
+# low priority OUTGOING traffic - you can leave this blankbit if you want
+NOPRIOHOSTSRC=
+NOPRIOHOSTDST=
+NOPRIOPORTSRC="6881 6882 6883 6884 6885 6886 6887 6888 6889 6890 6891 6892 6893 4225 4915 6346"
+NOPRIOPORTDST="6881 6882 6883 6884 6885 6886 6887 6888 6889 6890 6891 6892 6893 4225 4915 6346"
+
+# high priority OUTGOING traffic
+HIPRIOHOSTSRC=
+HIPRIOHOSTDST=66.132.16.130
+HIPRIOPORTSRC="53 27960 27970 27990 1109"
+HIPRIOPORTDST="53 27960 27970 27990 1109"
+
+#########################################################
+
+if [ "$ACT" = "test" ] ; then
+ echo "DEV ='$DEV'"
+ echo "BW  ='$BW'"
+ echo "BW90='$BW90'"
+ echo "BW10='$BW10'"
+fi
+
+
+if [ "$ACT" = "status" ]; then
+	tc -s qdisc ls dev $DEV
+	tc -s class ls dev $DEV
+	exit
+fi
+
+
+# clean existing down- and uplinkbit qdiscs, hide errors
+tc qdisc del dev $DEV root    2> /dev/null > /dev/null
+
+if [ "$ACT" = "stop" ] 
+then 
+	exit
+fi
+
+
+# Set up HTB scheduler
+
+tc qdisc add dev $DEV root handle 1: htb default 20
+
+
+# High priority traffic gets 80% of the pipeline with a big burst
+# Bulkbit traffic gets 10% of the pipeline then can borrow the rest
+# low priority traffic gets same but at lower priority and lower burst
+
+tc class add dev $DEV parent 1: classid 1:1   htb rate ${BW}kbit burst 8kbit cburst 8k
+tc class add dev $DEV parent 1:1 classid 1:10 htb rate ${BW80}kbit ceil ${BW90}kbit burst 8kbit cburst 8kbit prio 1
+tc class add dev $DEV parent 1:1 classid 1:20 htb rate ${BW20}kbit ceil ${BW80}kbit burst 4kbit cburst 1kbit prio 2
+
+tc class add dev $DEV parent 1:20 classid 1:21 htb rate ${BW10}kbit ceil ${BW70}kbit burst 4kbit cburst 1kbit prio 3
+tc class add dev $DEV parent 1:20 classid 1:22 htb rate ${BW10}kbit ceil ${BW70}kbit burst 4kbit cburst 1kbit prio 4
+tc class add dev $DEV parent 1:20 classid 1:23 htb rate ${BW10}kbit ceil ${BW70}kbit burst 4kbit cburst 1kbit prio 5
+tc class add dev $DEV parent 1:20 classid 1:24 htb rate ${BW10}kbit ceil ${BW70}kbit burst 4kbit cburst 1kbit prio 6
+
+tc class add dev $DEV parent 1:1 classid 1:30 htb rate ${BW10}kbit ceil ${BW70}kbit burst 2kbit cburst 1kbit prio 7
+
+
+
+# all get Stochastic Fairness:
+tc qdisc add dev $DEV parent 1:10 handle 10: sfq perturb 10
+tc qdisc add dev $DEV parent 1:20 handle 20: sfq perturb 10
+tc qdisc add dev $DEV parent 1:21 handle 21: sfq perturb 10
+tc qdisc add dev $DEV parent 1:22 handle 22: sfq perturb 10
+tc qdisc add dev $DEV parent 1:23 handle 23: sfq perturb 10
+tc qdisc add dev $DEV parent 1:24 handle 24: sfq perturb 10
+tc qdisc add dev $DEV parent 1:30 handle 30: sfq perturb 10
+
+# start filters
+# TOS Minimum Delay (ssh, NOT scp) in 1:10:
+tc filter add dev $DEV parent 1:0 protocol ip prio 10 u32 \
+      match ip tos 0x10 0xff  flowid 1:10
+
+# ICMP (ip protocol 1) in the interactive class 1:10 so we 
+# can do measurements & impress our friends:
+tc filter add dev $DEV parent 1:0 protocol ip prio 11 u32 \
+        match ip protocol 1 0xff flowid 1:10
+
+# Prioritize small UDP packets under 256 bytes
+tc filter add dev $DEV parent 1: protocol ip prio 12 u32 \
+    match ip protocol 17 0xff \
+    match u8 0x05 0x0f at 0 \
+    match u16 0x0000 0xff00 at 2 \
+    flowid 1:10
+
+# prioritize small TCP packets (<64 bytes)
+# XXX change ffc0 -> ff80 to allow up to 128 byte packets to be high priority
+
+tc filter add dev $DEV parent 1: protocol ip prio 13 u32 \
+   match ip protocol 6 0xff \
+   match u8 0x05 0x0f at 0 \
+   match u16 0x0000 0xff80 at 2 \
+   flowid 1:10
+
+# prioritize other stuff too
+tc filter add dev $DEV parent 1: protocol ip prio 14 u32 match ip sport 0x0000 0x0001 match ip dport 0x0000 0x0001 flowid 1:21
+tc filter add dev $DEV parent 1: protocol ip prio 15 u32 match ip sport 0x0001 0x0001 match ip dport 0x0000 0x0001 flowid 1:22
+tc filter add dev $DEV parent 1: protocol ip prio 16 u32 match ip sport 0x0000 0x0001 match ip dport 0x0001 0x0001 flowid 1:23
+tc filter add dev $DEV parent 1: protocol ip prio 17 u32 match ip sport 0x0001 0x0001 match ip dport 0x0001 0x0001 flowid 1:24
+
+
+for a in $HIPRIOPORTDST; do
+	tc filter add dev $DEV parent 1: protocol ip prio 18 u32 match ip dport $a 0xffff flowid 1:10
+done
+
+for a in $HIPRIOPORTSRC; do
+ 	tc filter add dev $DEV parent 1: protocol ip prio 19 u32 match ip sport $a 0xffff flowid 1:10
+done
+
+for a in $HIPRIOHOSTSRC; do
+ 	tc filter add dev $DEV parent 1: protocol ip prio 20 u32 match ip src $a flowid 1:10
+done
+
+for a in $HIPRIOHOSTDST; do
+ 	tc filter add dev $DEV parent 1: protocol ip prio 21 u32 match ip dst $a flowid 1:10
+done
+
+
+# some traffic however suffers a worse fate
+for a in $NOPRIOPORTDST; do
+	tc filter add dev $DEV parent 1: protocol ip prio 22 u32 match ip dport $a 0xffff flowid 1:30
+done
+
+for a in $NOPRIOPORTSRC; do
+ 	tc filter add dev $DEV parent 1: protocol ip prio 23 u32 match ip sport $a 0xffff flowid 1:30
+done
+
+for a in $NOPRIOHOSTSRC; do
+ 	tc filter add dev $DEV parent 1: protocol ip prio 24 u32 match ip src $a flowid 1:30
+done
+
+for a in $NOPRIOHOSTDST; do
+ 	tc filter add dev $DEV parent 1: protocol ip prio 25 u32 match ip dst $a flowid 1:30
+done
+
+
+# rest is 'non-interactive' ie 'bulk' and ends up in 1:20
+
+tc filter add dev $DEV parent 1: protocol ip prio 26 u32 match ip dst 0.0.0.0/0 flowid 1:20
+
+
